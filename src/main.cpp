@@ -321,6 +321,13 @@ int main(int argc, char** argv) {
                           << " rods ...\n";
             }
 
+            // Output comment headers
+            *out << "# Free volume measurements\n";
+            *out << "# Input file: " << opts.input_file << "\n";
+            *out << "# N_rods: " << rods.size() << "\n";
+            *out << "# Diameter: " << diameter << "\n";
+            *out << "# Angular samples: " << opts.n_samples << "\n";
+
             auto results = measure_all_rods(rods, params, opts.verbose);
             write_summary_table(*out, results);
 
