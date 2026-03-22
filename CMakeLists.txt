@@ -4,6 +4,14 @@ project(rod_free_volume LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+
+if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.24 AND NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING "CUDA architectures to build" FORCE)
+endif()
+
+option(ROD_FREE_VOLUME_ENABLE_CUDA "Build CUDA acceleration when a toolkit is available" ON)
 
 # ── OpenMP ──
 # On macOS with Apple Clang, OpenMP requires Homebrew libomp.
@@ -29,35 +37,66 @@ endif()
 find_package(OpenMP)
 if(OpenMP_CXX_FOUND)
     message(STATUS "OpenMP found — enabling multithreaded path")
-    add_compile_definitions(USE_OPENMP)
-    link_libraries(OpenMP::OpenMP_CXX)
 else()
     message(WARNING "OpenMP not found — running in serial mode")
 endif()
 
 # ── CUDA (optional) ──
-include(CheckLanguage)
-check_language(CUDA)
-if(CMAKE_CUDA_COMPILER)
-    enable_language(CUDA)
-    message(STATUS "CUDA found — enabling GPU path")
-    add_compile_definitions(USE_CUDA)
-    set(CUDA_SOURCES src/free_volume_cuda.cu)
-else()
-    message(STATUS "CUDA not found — GPU path disabled")
-    set(CUDA_SOURCES "")
-endif()
+set(CUDA_SOURCES "")
+set(CUDA_LIBRARIES "")
 
-# ── Include paths ──
-include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
+if(ROD_FREE_VOLUME_ENABLE_CUDA)
+    include(CheckLanguage)
+
+    if(NOT CMAKE_CUDA_COMPILER)
+        find_program(ROD_FREE_VOLUME_NVCC
+            NAMES nvcc
+            HINTS
+                ENV CUDA_HOME
+                ENV CUDA_PATH
+                /usr/local/cuda
+                /usr/local/cuda-12.9
+                /usr/local/cuda-12.7
+                /usr/local/cuda-12.0
+                /usr/local/cuda-12
+            PATH_SUFFIXES bin)
+
+        if(ROD_FREE_VOLUME_NVCC)
+            set(CMAKE_CUDA_COMPILER "${ROD_FREE_VOLUME_NVCC}" CACHE FILEPATH "CUDA compiler" FORCE)
+        endif()
+    endif()
+
+    check_language(CUDA)
+    if(CMAKE_CUDA_COMPILER)
+        enable_language(CUDA)
+        find_package(CUDAToolkit REQUIRED)
+        message(STATUS "CUDA found — enabling GPU path with ${CMAKE_CUDA_COMPILER}")
+        set(CUDA_SOURCES src/free_volume_cuda.cu)
+        set(CUDA_LIBRARIES CUDA::cudart)
+    else()
+        message(STATUS "CUDA not found — GPU path disabled")
+    endif()
+else()
+    message(STATUS "CUDA explicitly disabled")
+endif()
 
 # ── Library ──
 add_library(fvol_core
     src/free_volume.cpp
     ${CUDA_SOURCES}
 )
+
+target_include_directories(fvol_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_features(fvol_core PUBLIC cxx_std_17)
+
 if(OpenMP_CXX_FOUND)
     target_link_libraries(fvol_core PUBLIC OpenMP::OpenMP_CXX)
+    target_compile_definitions(fvol_core PUBLIC USE_OPENMP)
+endif()
+
+if(CUDA_SOURCES)
+    target_link_libraries(fvol_core PUBLIC ${CUDA_LIBRARIES})
+    target_compile_definitions(fvol_core PUBLIC USE_CUDA)
 endif()
 
 # ── Main executable ──

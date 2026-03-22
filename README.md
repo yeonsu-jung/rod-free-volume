@@ -5,13 +5,37 @@ Standalone C++ tool that measures translational and rotational free volume for e
 ## Build
 
 ```bash
-cd tools/rod-free-volume
 mkdir -p build && cd build
 cmake ..
 make -j$(nproc)
 ```
 
 OpenMP is auto-detected. CUDA is optional (auto-detected if `nvcc` is available).
+
+If CUDA is installed but `nvcc` is not on `PATH`, point CMake at the toolkit explicitly:
+
+```bash
+mkdir -p build && cd build
+cmake .. -DROD_FREE_VOLUME_ENABLE_CUDA=ON -DCUDAToolkit_ROOT=/usr/local/cuda
+cmake --build . -j$(nproc)
+```
+
+On cluster environments that use environment modules, load CUDA first and then configure with the module-provided compiler:
+
+```bash
+module load cuda/12.9.1-fasrc01
+mkdir -p build-cuda && cd build-cuda
+cmake .. -DROD_FREE_VOLUME_ENABLE_CUDA=ON -DCMAKE_CUDA_COMPILER="$(command -v nvcc)"
+cmake --build . -j$(nproc)
+```
+
+If you want a CPU-only build, disable CUDA explicitly:
+
+```bash
+mkdir -p build && cd build
+cmake .. -DROD_FREE_VOLUME_ENABLE_CUDA=OFF
+cmake --build . -j$(nproc)
+```
 
 ## Usage
 
