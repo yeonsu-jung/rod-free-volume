@@ -16,6 +16,18 @@
 #include <omp.h>
 #endif
 
+#ifdef USE_CUDA
+namespace fvol {
+namespace cuda {
+void launch_free_volume_cuda(
+    const void* host_rods, int n_rods,
+    int n_samples, int theta_coarse, int bisection_steps, double max_search_dist,
+    double* h_trans_area, double* h_solid_angle,
+    double* h_min_trans, double* h_min_rot);
+} // namespace cuda
+} // namespace fvol
+#endif
+
 namespace fvol {
 
 static constexpr double kPi  = 3.14159265358979323846;
@@ -252,6 +264,29 @@ std::vector<RodFreeVolume> measure_all_rods(
                       ? std::max(params.max_search_dist, max_len)
                       : max_len;
 
+#ifdef USE_CUDA
+    if (verbose) {
+        std::cerr << "  Running with CUDA acceleration...\n";
+    }
+    
+    std::vector<double> h_trans_area(N);
+    std::vector<double> h_solid_angle(N);
+    std::vector<double> h_min_trans(N);
+    std::vector<double> h_min_rot(N);
+
+    cuda::launch_free_volume_cuda(
+        rods.data(), N,
+        params.n_samples, params.theta_coarse, params.bisection_steps, params.max_search_dist,
+        h_trans_area.data(), h_solid_angle.data(),
+        h_min_trans.data(), h_min_rot.data());
+
+    for (int i = 0; i < N; ++i) {
+        results[i].free_translation_area = h_trans_area[i];
+        results[i].free_solid_angle      = h_solid_angle[i];
+        results[i].min_translation_dist  = h_min_trans[i];
+        results[i].min_rotation_angle    = h_min_rot[i];
+    }
+#else
 #ifdef USE_OPENMP
 #pragma omp parallel for schedule(dynamic)
 #endif
@@ -277,6 +312,7 @@ std::vector<RodFreeVolume> measure_all_rods(
     if (verbose) {
         std::cerr << "\n";
     }
+#endif
     return results;
 }
 

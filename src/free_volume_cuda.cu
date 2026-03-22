@@ -1,61 +1,61 @@
 /**
  * @file free_volume_cuda.cu
- * @brief CUDA kernel skeleton for rod free-volume computation.
- *
- * This is a structured placeholder. The per-rod loop from the CPU path
- * maps naturally to one CUDA thread per rod (or one block per rod with
- * threads handling different angular samples).
- *
- * Build: enabled only when USE_CUDA is defined in CMakeLists.
+ * @brief CUDA kernel for rod free-volume computation.
  */
 
 #ifdef USE_CUDA
 
 #include <cuda_runtime.h>
 #include <cstdio>
+#include <cmath>
 
 namespace fvol {
 namespace cuda {
 
-/**
- * Device-side Vec3 (minimal)
- */
+static constexpr double kPi  = 3.14159265358979323846;
+
 struct d_Vec3 {
     double x, y, z;
 };
 
-/**
- * Device-side Rod (flat POD)
- */
 struct d_Rod {
     d_Vec3 p1, p2;
     double diameter;
 };
 
-// ──────────────────────────────────────────────────────────────────────────
-// Device: segment distance (same algorithm as CPU)
-// ──────────────────────────────────────────────────────────────────────────
-
-__device__ double d_dot(d_Vec3 a, d_Vec3 b) {
-    return a.x*b.x + a.y*b.y + a.z*b.z;
+// Math helpers
+__device__ d_Vec3 d_add(d_Vec3 a, d_Vec3 b) { return {a.x+b.x, a.y+b.y, a.z+b.z}; }
+__device__ d_Vec3 d_sub(d_Vec3 a, d_Vec3 b) { return {a.x-b.x, a.y-b.y, a.z-b.z}; }
+__device__ d_Vec3 d_scale(d_Vec3 a, double s) { return {a.x*s, a.y*s, a.z*s}; }
+__device__ double d_dot(d_Vec3 a, d_Vec3 b) { return a.x*b.x + a.y*b.y + a.z*b.z; }
+__device__ d_Vec3 d_cross(d_Vec3 a, d_Vec3 b) {
+    return {a.y*b.z - a.z*b.y, a.z*b.x - a.x*b.z, a.x*b.y - a.y*b.x};
 }
-
-__device__ d_Vec3 d_sub(d_Vec3 a, d_Vec3 b) {
-    return {a.x-b.x, a.y-b.y, a.z-b.z};
-}
-
-__device__ d_Vec3 d_scale(d_Vec3 a, double s) {
-    return {a.x*s, a.y*s, a.z*s};
+__device__ double d_norm(d_Vec3 a) { return sqrt(a.x*a.x + a.y*a.y + a.z*a.z); }
+__device__ d_Vec3 d_normalized(d_Vec3 a) {
+    double n = d_norm(a);
+    if (n > 1e-15) return d_scale(a, 1.0/n);
+    return {0,0,0};
 }
 
 __device__ double d_clamp01(double x) {
     return fmin(fmax(x, 0.0), 1.0);
 }
 
-__device__ double d_segment_distance(
-    d_Vec3 p1s, d_Vec3 p1e,
-    d_Vec3 p2s, d_Vec3 p2e)
-{
+// Rod helpers
+__device__ d_Vec3 d_center(const d_Rod& r) { return d_scale(d_add(r.p1, r.p2), 0.5); }
+__device__ d_Vec3 d_axis(const d_Rod& r) { return d_normalized(d_sub(r.p2, r.p1)); }
+__device__ double d_length(const d_Rod& r) { return d_norm(d_sub(r.p2, r.p1)); }
+
+__device__ void d_build_perp_frame(d_Vec3 axis, d_Vec3* u, d_Vec3* v) {
+    d_Vec3 ref;
+    if (fabs(axis.x) < 0.9) ref = {1,0,0}; else ref = {0,1,0};
+    *u = d_normalized(d_cross(axis, ref));
+    *v = d_normalized(d_cross(axis, *u));
+}
+
+// Distance & Collision
+__device__ double d_segment_distance(d_Vec3 p1s, d_Vec3 p1e, d_Vec3 p2s, d_Vec3 p2e) {
     d_Vec3 d1 = d_sub(p1e, p1s);
     d_Vec3 d2 = d_sub(p2e, p2s);
     d_Vec3 d12 = d_sub(p2s, p1s);
@@ -69,10 +69,17 @@ __device__ double d_segment_distance(
 
     double t, u;
     if (D1 < 1e-30 || D2 < 1e-30) {
-        t = u = 0.0;
+        if (D1 > 1e-30) { u = 0.0; t = d_clamp01(S1 / D1); }
+        else if (D2 > 1e-30) { t = 0.0; u = d_clamp01(-S2 / D2); }
+        else { t = u = 0.0; }
     } else if (fabs(den) < 1e-12) {
         t = 0.0;
         u = d_clamp01(-S2 / D2);
+        double uf = d_clamp01(u);
+        if (fabs(uf - u) > 1e-12) {
+            t = d_clamp01((uf * R + S1) / D1);
+            u = uf;
+        }
     } else {
         t = d_clamp01((S1 * D2 - S2 * R) / den);
         u = (t * R - S2) / D2;
@@ -83,24 +90,36 @@ __device__ double d_segment_distance(
         }
     }
 
-    d_Vec3 diff = {
-        d1.x*t - d2.x*u - d12.x,
-        d1.y*t - d2.y*u - d12.y,
-        d1.z*t - d2.z*u - d12.z
-    };
+    d_Vec3 diff = d_sub(d_sub(d_scale(d1, t), d_scale(d2, u)), d12);
     return sqrt(diff.x*diff.x + diff.y*diff.y + diff.z*diff.z);
 }
 
-// ──────────────────────────────────────────────────────────────────────────
-// Kernel: one thread per rod
-// ──────────────────────────────────────────────────────────────────────────
+__device__ bool d_capsule_collide_translated(const d_Rod& test, d_Vec3 offset, const d_Rod& neighbor) {
+    d_Vec3 p1 = d_add(test.p1, offset);
+    d_Vec3 p2 = d_add(test.p2, offset);
+    double dist = d_segment_distance(p1, p2, neighbor.p1, neighbor.p2);
+    return dist <= (test.diameter*0.5 + neighbor.diameter*0.5 + 1e-12);
+}
 
+__device__ bool d_capsule_collide_rotated(const d_Rod& test, d_Vec3 new_dir, const d_Rod& neighbor) {
+    d_Vec3 c = d_center(test);
+    double hl = d_length(test) * 0.5;
+    d_Vec3 d = d_normalized(new_dir);
+    d_Vec3 shift = d_scale(d, hl);
+    d_Vec3 p1 = d_sub(c, shift);
+    d_Vec3 p2 = d_add(c, shift);
+    double dist = d_segment_distance(p1, p2, neighbor.p1, neighbor.p2);
+    return dist <= (test.diameter*0.5 + neighbor.diameter*0.5 + 1e-12);
+}
+
+// Kernel
 __global__ void compute_free_volume_kernel(
     const d_Rod* __restrict__ rods,
     int n_rods,
     int n_samples,
     int theta_coarse,
     int bisection_steps,
+    double max_search_dist,
     double* __restrict__ out_trans_area,
     double* __restrict__ out_solid_angle,
     double* __restrict__ out_min_trans,
@@ -109,33 +128,212 @@ __global__ void compute_free_volume_kernel(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n_rods) return;
 
-    // TODO: Implement the per-rod free volume computation here.
-    // The algorithm mirrors the CPU path:
-    //   1. Build local frame (axis, u, v) for rods[idx]
-    //   2. For each ψ in n_samples: binary search translation distance
-    //   3. For each φ in n_samples: binary search rotation angle
-    //   4. Integrate to get area and solid angle
-    //
-    // Neighbor pruning can use shared memory for the test rod's AABB
-    // and a two-pass approach (count then process).
+    d_Rod test = rods[idx];
+    d_Vec3 ax = d_axis(test);
+    d_Vec3 u, v;
+    d_build_perp_frame(ax, &u, &v);
+    
+    double default_max_dist = max_search_dist;
+    if (default_max_dist <= 0.0) {
+        default_max_dist = d_length(test);
+    }
+    
+    double max_disp = fmax(default_max_dist, d_length(test));
+    double expand = test.diameter*0.5 + max_disp;
+    
+    double t_lo_x = fmin(test.p1.x, test.p2.x) - expand;
+    double t_hi_x = fmax(test.p1.x, test.p2.x) + expand;
+    double t_lo_y = fmin(test.p1.y, test.p2.y) - expand;
+    double t_hi_y = fmax(test.p1.y, test.p2.y) + expand;
+    double t_lo_z = fmin(test.p1.z, test.p2.z) - expand;
+    double t_hi_z = fmax(test.p1.z, test.p2.z) + expand;
 
-    out_trans_area[idx]  = 0.0;
-    out_solid_angle[idx] = 0.0;
-    out_min_trans[idx]   = 0.0;
-    out_min_rot[idx]     = 0.0;
+    // Translation scan
+    double trans_area = 0.0;
+    double min_trans = 1e30;
+    
+    for (int i = 0; i < n_samples; ++i) {
+        double psi = 2.0 * kPi * i / n_samples;
+        d_Vec3 dir = d_add(d_scale(u, cos(psi)), d_scale(v, sin(psi)));
+        
+        double lo = 0.0;
+        double hi = default_max_dist;
+        bool found = false;
+        
+        for (int step = 1; step <= theta_coarse; ++step) {
+            double d = default_max_dist * step / theta_coarse;
+            d_Vec3 offset = d_scale(dir, d);
+            bool collided = false;
+            
+            for (int j = 0; j < n_rods; ++j) {
+                if (j == idx) continue;
+                d_Rod nj = rods[j];
+                
+                double n_lo_x = fmin(nj.p1.x, nj.p2.x) - nj.diameter*0.5;
+                if (t_hi_x < n_lo_x) continue;
+                double n_hi_x = fmax(nj.p1.x, nj.p2.x) + nj.diameter*0.5;
+                if (t_lo_x > n_hi_x) continue;
+                
+                double n_lo_y = fmin(nj.p1.y, nj.p2.y) - nj.diameter*0.5;
+                if (t_hi_y < n_lo_y) continue;
+                double n_hi_y = fmax(nj.p1.y, nj.p2.y) + nj.diameter*0.5;
+                if (t_lo_y > n_hi_y) continue;
+                
+                double n_lo_z = fmin(nj.p1.z, nj.p2.z) - nj.diameter*0.5;
+                if (t_hi_z < n_lo_z) continue;
+                double n_hi_z = fmax(nj.p1.z, nj.p2.z) + nj.diameter*0.5;
+                if (t_lo_z > n_hi_z) continue;
+
+                if (d_capsule_collide_translated(test, offset, nj)) {
+                    collided = true;
+                    break;
+                }
+            }
+            if (collided) {
+                hi = d;
+                lo = default_max_dist * (step - 1) / theta_coarse;
+                found = true;
+                break;
+            }
+        }
+        
+        if (found) {
+            for (int iter = 0; iter < bisection_steps; ++iter) {
+                double mid = 0.5 * (lo + hi);
+                d_Vec3 offset = d_scale(dir, mid);
+                bool collided = false;
+                for (int j = 0; j < n_rods; ++j) {
+                    if (j == idx) continue;
+                    d_Rod nj = rods[j];
+                    
+                    double n_lo_x = fmin(nj.p1.x, nj.p2.x) - nj.diameter*0.5;
+                    if (t_hi_x < n_lo_x) continue;
+                    double n_hi_x = fmax(nj.p1.x, nj.p2.x) + nj.diameter*0.5;
+                    if (t_lo_x > n_hi_x) continue;
+                    double n_lo_y = fmin(nj.p1.y, nj.p2.y) - nj.diameter*0.5;
+                    if (t_hi_y < n_lo_y) continue;
+                    double n_hi_y = fmax(nj.p1.y, nj.p2.y) + nj.diameter*0.5;
+                    if (t_lo_y > n_hi_y) continue;
+                    double n_lo_z = fmin(nj.p1.z, nj.p2.z) - nj.diameter*0.5;
+                    if (t_hi_z < n_lo_z) continue;
+                    double n_hi_z = fmax(nj.p1.z, nj.p2.z) + nj.diameter*0.5;
+                    if (t_lo_z > n_hi_z) continue;
+                    
+                    if (d_capsule_collide_translated(test, offset, nj)) {
+                        collided = true;
+                        break;
+                    }
+                }
+                if (collided) hi = mid;
+                else lo = mid;
+            }
+        }
+        
+        double dpsi = 2.0 * kPi / n_samples;
+        trans_area += 0.5 * hi * hi * dpsi;
+        if (hi < min_trans) min_trans = hi;
+    }
+
+    // Rotation scan
+    double solid_angle = 0.0;
+    double min_rot = 1e30;
+    
+    for (int i = 0; i < n_samples; ++i) {
+        double phi = 2.0 * kPi * i / n_samples;
+        double lo = 0.0;
+        double hi = kPi;
+        bool found = false;
+        
+        for (int step = 1; step < theta_coarse; ++step) {
+            double theta = kPi * step / (theta_coarse - 1);
+            double sin_t = sin(theta);
+            double cos_t = cos(theta);
+            d_Vec3 new_dir = d_add(d_add(d_scale(u, sin_t * cos(phi)), d_scale(v, sin_t * sin(phi))), d_scale(ax, cos_t));
+            
+            bool collided = false;
+            for (int j = 0; j < n_rods; ++j) {
+                if (j == idx) continue;
+                d_Rod nj = rods[j];
+                
+                double n_lo_x = fmin(nj.p1.x, nj.p2.x) - nj.diameter*0.5;
+                if (t_hi_x < n_lo_x) continue;
+                double n_hi_x = fmax(nj.p1.x, nj.p2.x) + nj.diameter*0.5;
+                if (t_lo_x > n_hi_x) continue;
+                double n_lo_y = fmin(nj.p1.y, nj.p2.y) - nj.diameter*0.5;
+                if (t_hi_y < n_lo_y) continue;
+                double n_hi_y = fmax(nj.p1.y, nj.p2.y) + nj.diameter*0.5;
+                if (t_lo_y > n_hi_y) continue;
+                double n_lo_z = fmin(nj.p1.z, nj.p2.z) - nj.diameter*0.5;
+                if (t_hi_z < n_lo_z) continue;
+                double n_hi_z = fmax(nj.p1.z, nj.p2.z) + nj.diameter*0.5;
+                if (t_lo_z > n_hi_z) continue;
+                
+                if (d_capsule_collide_rotated(test, new_dir, nj)) {
+                    collided = true;
+                    break;
+                }
+            }
+            if (collided) {
+                hi = theta;
+                lo = kPi * (step - 1) / (theta_coarse - 1);
+                found = true;
+                break;
+            }
+        }
+        
+        if (found) {
+            for (int iter = 0; iter < bisection_steps; ++iter) {
+                double mid = 0.5 * (lo + hi);
+                double sin_t = sin(mid);
+                double cos_t = cos(mid);
+                d_Vec3 new_dir = d_add(d_add(d_scale(u, sin_t * cos(phi)), 
+                                             d_scale(v, sin_t * sin(phi))), 
+                                       d_scale(ax, cos_t));
+                bool collided = false;
+                for (int j = 0; j < n_rods; ++j) {
+                    if (j == idx) continue;
+                    d_Rod nj = rods[j];
+                    
+                    double n_lo_x = fmin(nj.p1.x, nj.p2.x) - nj.diameter*0.5;
+                    if (t_hi_x < n_lo_x) continue;
+                    double n_hi_x = fmax(nj.p1.x, nj.p2.x) + nj.diameter*0.5;
+                    if (t_lo_x > n_hi_x) continue;
+                    double n_lo_y = fmin(nj.p1.y, nj.p2.y) - nj.diameter*0.5;
+                    if (t_hi_y < n_lo_y) continue;
+                    double n_hi_y = fmax(nj.p1.y, nj.p2.y) + nj.diameter*0.5;
+                    if (t_lo_y > n_hi_y) continue;
+                    double n_lo_z = fmin(nj.p1.z, nj.p2.z) - nj.diameter*0.5;
+                    if (t_hi_z < n_lo_z) continue;
+                    double n_hi_z = fmax(nj.p1.z, nj.p2.z) + nj.diameter*0.5;
+                    if (t_lo_z > n_hi_z) continue;
+                    
+                    if (d_capsule_collide_rotated(test, new_dir, nj)) {
+                        collided = true;
+                        break;
+                    }
+                }
+                if (collided) hi = mid;
+                else lo = mid;
+            }
+        }
+        
+        double dphi = 2.0 * kPi / n_samples;
+        solid_angle += (1.0 - cos(hi)) * dphi;
+        if (hi < min_rot) min_rot = hi;
+    }
+    
+    out_trans_area[idx] = trans_area;
+    out_solid_angle[idx] = solid_angle;
+    out_min_trans[idx] = min_trans;
+    out_min_rot[idx] = min_rot;
 }
-
-// ──────────────────────────────────────────────────────────────────────────
-// Host launch wrapper
-// ──────────────────────────────────────────────────────────────────────────
 
 void launch_free_volume_cuda(
     const void* host_rods, int n_rods,
-    int n_samples, int theta_coarse, int bisection_steps,
+    int n_samples, int theta_coarse, int bisection_steps, double max_search_dist,
     double* h_trans_area, double* h_solid_angle,
     double* h_min_trans, double* h_min_rot)
 {
-    // Allocate device memory
     d_Rod* d_rods;
     cudaMalloc(&d_rods, n_rods * sizeof(d_Rod));
     cudaMemcpy(d_rods, host_rods, n_rods * sizeof(d_Rod), cudaMemcpyHostToDevice);
@@ -149,7 +347,7 @@ void launch_free_volume_cuda(
     int block = 256;
     int grid = (n_rods + block - 1) / block;
     compute_free_volume_kernel<<<grid, block>>>(
-        d_rods, n_rods, n_samples, theta_coarse, bisection_steps,
+        d_rods, n_rods, n_samples, theta_coarse, bisection_steps, max_search_dist,
         d_ta, d_sa, d_mt, d_mr);
 
     cudaMemcpy(h_trans_area, d_ta, n_rods * sizeof(double), cudaMemcpyDeviceToHost);
